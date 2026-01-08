@@ -1,205 +1,325 @@
-
-import anthropic
+"""
+Integrated Project Management Agent Core
+Coordinates all modules: planner, tracker, report generator, executor, summarizer
+"""
+from anthropic import Anthropic
+from typing import Dict, List, Optional
 import json
-import os
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-from .planner import TaskPlanner
-from .executor import TaskExecutor
-from .tools import ToolRegistry
 
-class ResearchAgent:
+# Import all modules
+from .planner import ProjectPlanner
+from .tracker import ProgressTracker
+from .report_generator import ReportGenerator
+from .executor import TaskExecutor
+from .summarizer import ProjectSummarizer
+from .tools import DateTimeTools, CalculationTools, DataFormatter
+
+class ProjectManagementAgent:
+    """
+    Main Project Management Agent
+    Orchestrates all components to provide comprehensive project management capabilities
+    """
     
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.planner = TaskPlanner(self.client)
-        self.executor = TaskExecutor(self.client)
-        self.tool_registry = ToolRegistry()
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client = Anthropic(api_key=api_key)
+        
+        # Initialize all modules
+        self.planner = ProjectPlanner(api_key)
+        self.tracker = ProgressTracker(api_key)
+        self.report_generator = ReportGenerator(api_key)
+        self.executor = TaskExecutor(api_key)
+        self.summarizer = ProjectSummarizer(api_key)
+        
+        # Conversation history
         self.conversation_history = []
-        self.current_goal = None
-        self.execution_log = []
+        self.current_project_id = None
         
-    def understand_goal(self, goal: str) -> Dict[str, Any]:
-       
-        system_prompt = """You are an AI agent that understands research goals.
-         Analyze the goal and extract:
-        1. Main objective
-        2. Key topics/entities
-        3. Expected deliverable type (report, summary, analysis, etc.)
-        4. Scope and constraints
-        5. Success criteria
-        
-        Return as JSON with keys: objective, topics, deliverable_type, scope, success_criteria"""
-        
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            system=system_prompt,
-            messages=[{
-                "role": "user",
-                "content": f"Goal: {goal}\n\nAnalyze this goal and return the structured information as JSON."
-            }]
-        )
-        
-        try:
-            understanding = json.loads(response.content[0].text)
-        except:
-            # Fallback parsing
-            understanding = {
-                "objective": goal,
-                "topics": [],
-                "deliverable_type": "report",
-                "scope": "comprehensive",
-                "success_criteria": ["Complete research", "Accurate information", "Well-structured output"]
-            }
-        
-        self.current_goal = understanding
-        self.log_event("goal_understood", understanding)
-        return understanding
-    
-    def create_plan(self, goal_understanding: Dict[str, Any]) -> List[Dict[str, Any]]:
-        
-        plan = self.planner.create_plan(goal_understanding)
-        self.log_event("plan_created", {"steps": len(plan), "plan": plan})
-        return plan
-    
-    async def execute_plan(self, plan: List[Dict[str, Any]], progress_callback=None) -> Dict[str, Any]:
-       
-        results = {
-            "steps_completed": 0,
-            "total_steps": len(plan),
-            "step_results": [],
-            "final_output": None,
-            "status": "in_progress"
-        }
-        
-        for i, step in enumerate(plan):
-            self.log_event("step_started", step)
-            
-            try:
-                step_result = await self.executor.execute_step(
-                    step, 
-                    self.tool_registry,
-                    context=results["step_results"]
-                )
-                
-                results["step_results"].append({
-                    "step_number": i + 1,
-                    "step": step,
-                    "result": step_result,
-                    "status": "completed",
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                results["steps_completed"] = i + 1
-                
-                if progress_callback:
-                    await progress_callback(results)
-                    
-                self.log_event("step_completed", step_result)
-                
-            except Exception as e:
-                error_result = {
-                    "step_number": i + 1,
-                    "step": step,
-                    "error": str(e),
-                    "status": "failed",
-                    "timestamp": datetime.now().isoformat()
-                }
-                results["step_results"].append(error_result)
-                self.log_event("step_failed", error_result)
-                
-                # Try to recover or continue
-                if not step.get("critical", True):
-                    continue
-                else:
-                    results["status"] = "failed"
-                    return results
-        
-        results["status"] = "completed"
-        return results
-    
-    def synthesize_results(self, execution_results: Dict[str, Any]) -> str:
-        
-        system_prompt = """You are creating the final deliverable for a research task.
-        
-        Synthesize all the research findings into a comprehensive, well-structured output.
-        Use markdown formatting for clarity.
-        
-        Include:
-        - Executive Summary
-        - Main Findings (organized by topic)
-        - Key Statistics and Data Points
-        - Sources and References
-        - Conclusion
+        # System prompt
+        self.system_prompt = """You are an expert Project Management AI Agent. You help users:
+
+1. **Plan Projects**: Break down goals into phases, milestones, and actionable tasks
+2. **Create Timelines**: Generate realistic schedules with dependencies and deadlines
+3. **Track Progress**: Monitor task completion, calculate metrics, identify blockers
+4. **Generate Reports**: Create comprehensive status reports for various audiences
+
+**Your Capabilities:**
+- Intelligent goal decomposition
+- Resource estimation and planning
+- Critical path analysis
+- Risk identification and mitigation
+- Progress monitoring and forecasting
+- Executive summaries and detailed reports
+
+**Communication Style:**
+- Be clear, structured, and actionable
+- Use data to support recommendations
+- Proactively identify risks and opportunities
+- Adapt your communication to the audience (team, executive, stakeholder)
+
+**When Users Request:**
+- Project creation → Generate detailed project plan with phases and tasks
+- Status updates → Provide current metrics and health indicators
+- Task updates → Analyze impact on timeline and dependencies
+- Reports → Create appropriate format based on audience
+- Recommendations → Provide data-driven suggestions
+
+Always be proactive in identifying potential issues and suggesting solutions."""
+
+    def chat(self, user_message: str, project_context: Optional[Dict] = None) -> Dict:
         """
+        Main chat interface with context-aware responses
+        """
+        # Parse user intent
+        intent_data = self.executor.parse_user_intent(user_message, project_context)
+        intent = intent_data.get("intent")
         
+        # Add context to message
+        full_message = user_message
+        if project_context:
+            full_message += f"\n\n[Project Context Available]"
         
-        findings = []
-        for step_result in execution_results["step_results"]:
-            if step_result["status"] == "completed":
-                findings.append(f"## {step_result['step']['description']}\n\n{step_result['result']}")
+        # Add to conversation history
+        self.conversation_history.append({
+            "role": "user",
+            "content": full_message
+        })
         
-        content = "\n\n".join(findings)
-        
+        # Get response from Claude
         response = self.client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4000,
-            system=system_prompt,
-            messages=[{
-                "role": "user",
-                "content": f"Original Goal: {self.current_goal['objective']}\n\nResearch Findings:\n\n{content}\n\nCreate the final comprehensive report."
-            }]
+            system=self.system_prompt,
+            messages=self.conversation_history
         )
         
-        final_output = response.content[0].text
-        self.log_event("results_synthesized", {"length": len(final_output)})
-        return final_output
-    
-    async def run(self, goal: str, progress_callback=None) -> Dict[str, Any]:
-      
-        try:
-            
-            goal_understanding = self.understand_goal(goal)
-            if progress_callback:
-                await progress_callback({"stage": "understanding", "data": goal_understanding})
-            
-           
-            plan = self.create_plan(goal_understanding)
-            if progress_callback:
-                await progress_callback({"stage": "planning", "data": plan})
-            
-            
-            execution_results = await self.execute_plan(plan, progress_callback)
-            
-            
-            final_output = self.synthesize_results(execution_results)
-            execution_results["final_output"] = final_output
-            
-            
-            return {
-                "success": True,
-                "goal": goal,
-                "understanding": goal_understanding,
-                "plan": plan,
-                "execution": execution_results,
-                "output": final_output,
-                "log": self.execution_log
-            }
-            
-        except Exception as e:
-            self.log_event("agent_error", {"error": str(e)})
-            return {
-                "success": False,
-                "error": str(e),
-                "log": self.execution_log
-            }
-    
-    def log_event(self, event_type: str, data: Any):
+        assistant_message = response.content[0].text
         
-        self.execution_log.append({
-            "timestamp": datetime.now().isoformat(),
-            "event": event_type,
-            "data": data
+        # Add to history
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": assistant_message
         })
+        
+        return {
+            "response": assistant_message,
+            "intent": intent,
+            "usage": {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens
+            }
+        }
+    
+    # ==================== PROJECT PLANNING ====================
+    
+    def create_project(self, project_goal: str, constraints: Optional[Dict] = None) -> Dict:
+        """
+        Create a comprehensive project plan from a goal
+        """
+        # Use planner to break down goals
+        project_plan = self.planner.break_down_goals(project_goal, constraints)
+        
+        # Create timeline
+        timeline = self.planner.create_timeline(project_plan)
+        
+        # Estimate resources
+        resources = self.planner.estimate_resources(project_plan)
+        
+        # Identify critical path
+        critical_path = self.planner.identify_critical_path(project_plan)
+        
+        return {
+            "project_plan": project_plan,
+            "timeline": timeline,
+            "resources": resources,
+            "critical_path": critical_path
+        }
+    
+    def update_project_plan(self, current_plan: Dict, adjustments: Dict) -> Dict:
+        """
+        Update project plan based on changes
+        """
+        return self.planner.adjust_timeline(current_plan, adjustments)
+    
+    # ==================== PROGRESS TRACKING ====================
+    
+    def update_task(self, task_id: str, status: str, project_data: Dict,
+                   notes: Optional[str] = None, actual_hours: Optional[float] = None) -> Dict:
+        """
+        Update task status and get impact analysis
+        """
+        update_result = self.tracker.update_task_status(
+            task_id, status, project_data, notes, actual_hours
+        )
+        
+        # Get updated completion percentage
+        completion = self.tracker.calculate_completion_percentage(project_data)
+        
+        return {
+            "update_result": update_result,
+            "completion_metrics": completion
+        }
+    
+    def get_project_status(self, project_data: Dict) -> Dict:
+        """
+        Get comprehensive project status
+        """
+        # Calculate completion
+        completion = self.tracker.calculate_completion_percentage(project_data)
+        
+        # Monitor deadlines
+        deadline_status = self.tracker.monitor_deadlines(project_data)
+        
+        # Identify blockers
+        blockers = self.tracker.identify_blockers(project_data)
+        
+        # Get summary
+        summary = self.summarizer.aggregate_metrics(project_data)
+        
+        return {
+            "completion": completion,
+            "deadline_status": deadline_status,
+            "blockers": blockers,
+            "metrics": summary
+        }
+    
+    def track_milestone(self, milestone_name: str, project_data: Dict) -> Dict:
+        """
+        Track specific milestone completion
+        """
+        return self.tracker.track_milestone_completion(milestone_name, project_data)
+    
+    # ==================== REPORT GENERATION ====================
+    
+    def generate_status_report(self, project_data: Dict, report_type: str = "weekly") -> str:
+        """
+        Generate comprehensive status report
+        """
+        return self.report_generator.generate_status_report(project_data, report_type)
+    
+    def generate_executive_summary(self, project_data: Dict) -> Dict:
+        """
+        Generate executive summary
+        """
+        return self.report_generator.generate_executive_summary(project_data)
+    
+    def generate_risk_report(self, project_data: Dict) -> Dict:
+        """
+        Generate risk and bottleneck analysis
+        """
+        return self.report_generator.identify_risks_and_bottlenecks(project_data)
+    
+    def generate_progress_summary(self, project_data: Dict, period: str = "this_week") -> Dict:
+        """
+        Generate progress summary for time period
+        """
+        return self.report_generator.create_progress_summary(project_data, period)
+    
+    def generate_milestone_report(self, milestone_name: str, project_data: Dict) -> str:
+        """
+        Generate milestone-specific report
+        """
+        return self.report_generator.generate_milestone_report(milestone_name, project_data)
+    
+    def get_dashboard_metrics(self, project_data: Dict) -> Dict:
+        """
+        Get metrics for dashboard visualization
+        """
+        return self.report_generator.generate_metrics_dashboard(project_data)
+    
+    # ==================== TASK EXECUTION ====================
+    
+    def suggest_next_tasks(self, project_data: Dict, team_capacity: Optional[Dict] = None) -> Dict:
+        """
+        Suggest which tasks to work on next
+        """
+        return self.executor.suggest_next_tasks(project_data, team_capacity)
+    
+    def validate_task_dependencies(self, task_id: str, project_data: Dict) -> Dict:
+        """
+        Validate if task can be started
+        """
+        return self.executor.validate_task_dependencies(task_id, project_data)
+    
+    def handle_scope_change(self, change_request: Dict, project_data: Dict) -> Dict:
+        """
+        Analyze scope change impact
+        """
+        return self.executor.handle_scope_change(change_request, project_data)
+    
+    def assign_task(self, task_id: str, available_team: List[Dict], project_data: Dict) -> Dict:
+        """
+        Suggest best team member for task
+        """
+        return self.executor.coordinate_team_assignment(task_id, available_team, project_data)
+    
+    # ==================== SUMMARIZATION ====================
+    
+    def summarize_for_audience(self, project_data: Dict, audience: str = "team") -> str:
+        """
+        Create audience-specific summary
+        audience: team, executive, stakeholder, technical
+        """
+        return self.summarizer.summarize_project_status(project_data, audience)
+    
+    def get_quick_summary(self, project_data: Dict) -> str:
+        """
+        Get brief executive brief (elevator pitch)
+        """
+        return self.summarizer.create_executive_brief(project_data)
+    
+    def summarize_phase(self, phase_name: str, project_data: Dict) -> Dict:
+        """
+        Summarize specific project phase
+        """
+        return self.summarizer.summarize_phase(phase_name, project_data)
+    
+    def get_highlights(self, project_data: Dict, period: str = "this_week") -> Dict:
+        """
+        Get key highlights for period
+        """
+        return self.summarizer.generate_highlights(project_data, period)
+    
+    def create_stakeholder_update(self, project_data: Dict, 
+                                  stakeholder_interests: List[str]) -> str:
+        """
+        Create tailored stakeholder update
+        """
+        return self.summarizer.create_stakeholder_update(project_data, stakeholder_interests)
+    
+    # ==================== ANALYTICS ====================
+    
+    def get_burndown_data(self, project_data: Dict, 
+                         historical_data: Optional[List] = None) -> Dict:
+        """
+        Generate burndown chart data
+        """
+        return self.tracker.generate_burndown_data(project_data, historical_data)
+    
+    def compare_progress_over_time(self, historical_data: List[Dict]) -> Dict:
+        """
+        Compare project progress over time
+        """
+        return self.summarizer.compare_progress_over_time(historical_data)
+    
+    def analyze_team_performance(self, project_data: Dict, 
+                                team_data: Optional[Dict] = None) -> Dict:
+        """
+        Analyze team performance
+        """
+        return self.summarizer.summarize_team_performance(project_data, team_data)
+    
+    # ==================== UTILITIES ====================
+    
+    def reset_conversation(self):
+        """Reset conversation history"""
+        self.conversation_history = []
+        self.current_project_id = None
+    
+    def set_current_project(self, project_id: str):
+        """Set current project context"""
+        self.current_project_id = project_id
+    
+    def get_conversation_history(self) -> List[Dict]:
+        """Get conversation history"""
+        return self.conversation_history
